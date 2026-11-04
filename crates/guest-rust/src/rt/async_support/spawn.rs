@@ -102,7 +102,18 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
-    use std::task::Waker;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Wake, Waker};
+
+    /// A waker that records being woken.
+    struct Woken(AtomicBool);
+
+    impl Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     // One test, because `SPAWNED` is one queue for the whole process and
     // tests in one binary run on several threads.
@@ -154,6 +165,55 @@ mod tests {
                 }
             }
             assert!(tasks.is_empty());
+
+            // The case an executor stalls in: another task waits, the root is
+            // the only one ready, and it spawns work and waits for it. The
+            // set's poll ends with nothing left to poll and wakes nothing, so
+            // the spawned task must be polled by this call or by none.
+            let companion_waiting = Rc::new(Cell::new(false));
+            let called = Rc::new(Cell::new(false));
+            let (companion_flag, root_flag) =
+                (companion_waiting.clone(), companion_waiting.clone());
+            let (spawned_called, root_called) = (called.clone(), called.clone());
+            let mut tasks = Tasks::new(Box::pin(async move {
+                spawn(std::future::poll_fn(move |_| {
+                    companion_flag.set(true);
+                    Poll::<()>::Pending
+                }));
+                while !root_flag.get() {
+                    let mut yielded = false;
+                    std::future::poll_fn(|cx| {
+                        if yielded {
+                            Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                spawn(async move { spawned_called.set(true) });
+                std::future::poll_fn(|_| {
+                    if root_called.get() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }));
+            // Polled the way an executor polls: again only once woken.
+            let woken = Arc::new(Woken(AtomicBool::new(true)));
+            let waker = Waker::from(woken.clone());
+            let mut woken_cx = Context::from_waker(&waker);
+            while woken.0.swap(false, Ordering::SeqCst) && !called.get() {
+                let _ = tasks.poll_next(&mut woken_cx);
+            }
+            assert!(
+                called.get(),
+                "the task spawned beside a waiting one was never polled"
+            );
 
             // A task that spawns nothing and waits leaves `poll_next` answering
             // `Pending` without spinning.
