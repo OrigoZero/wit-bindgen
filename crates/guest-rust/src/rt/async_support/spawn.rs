@@ -26,13 +26,29 @@ impl<'a> Tasks<'a> {
         }
     }
 
+    /// Poll the tasks, and every task one of them spawned while being
+    /// polled, until one completes or none can progress.
+    ///
+    /// A task queued by [`spawn`] is moved into the set after the poll that
+    /// queued it, and moving it in wakes nothing. Returning `Pending` then
+    /// would leave it unpolled until some other event arrived for this
+    /// computation, so the set is polled again whenever a poll that came back
+    /// `Pending` moved spawned tasks in: they are polled before this returns.
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<()>> {
-        unsafe {
+        loop {
             let ret = self.tasks.poll_next_unpin(cx);
-            if !SPAWNED.is_empty() {
-                self.tasks.extend(SPAWNED.drain(..));
+            let spawned = unsafe {
+                if SPAWNED.is_empty() {
+                    false
+                } else {
+                    self.tasks.extend(SPAWNED.drain(..));
+                    true
+                }
+            };
+            match ret {
+                Poll::Pending if spawned => continue,
+                ret => return ret,
             }
-            ret
         }
     }
 
@@ -79,4 +95,71 @@ impl<'a> Tasks<'a> {
 /// [#1305]: https://github.com/bytecodealliance/wit-bindgen/issues/1305
 pub fn spawn(future: impl Future<Output = ()> + 'static) {
     unsafe { SPAWNED.push(Box::pin(future)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::task::Waker;
+
+    // One test, because `SPAWNED` is one queue for the whole process and
+    // tests in one binary run on several threads.
+    #[test]
+    fn a_task_spawned_while_the_others_wait_is_polled_before_poll_next_returns() {
+        for _ in 0..2 {
+            // A root that spawns a task and then waits on something only that
+            // task can finish, the way a caller awaits the answer of work it
+            // spawned.
+            let answered = Rc::new(Cell::new(false));
+            let waiting: Rc<Cell<Option<Waker>>> = Rc::new(Cell::new(None));
+            let (spawned_answered, spawned_waiting) = (answered.clone(), waiting.clone());
+            let (root_answered, root_waiting) = (answered.clone(), waiting.clone());
+            let root: BoxFuture<'_> = Box::pin(async move {
+                spawn(async move {
+                    spawned_answered.set(true);
+                    if let Some(waker) = spawned_waiting.take() {
+                        waker.wake();
+                    }
+                });
+                std::future::poll_fn(|cx| {
+                    if root_answered.get() {
+                        Poll::Ready(())
+                    } else {
+                        root_waiting.set(Some(cx.waker().clone()));
+                        Poll::Pending
+                    }
+                })
+                .await;
+            });
+            let mut tasks = Tasks::new(root);
+            let mut cx = Context::from_waker(Waker::noop());
+
+            // The spawned task runs within the first poll; before, it sat in
+            // the set unpolled while this answered `Pending` and nothing was
+            // woken, so an executor would wait for an event that only the
+            // spawned task could cause.
+            let first = tasks.poll_next(&mut cx);
+            assert!(answered.get(), "the spawned task was not polled");
+            assert_eq!(first, Poll::Ready(Some(())), "the spawned task completed");
+
+            // The root, which the spawned task's answer unblocks, completes
+            // once it is polled again, and then nothing is left.
+            loop {
+                match tasks.poll_next(&mut cx) {
+                    Poll::Ready(Some(())) => continue,
+                    Poll::Ready(None) => break,
+                    Poll::Pending => panic!("the root waits on nothing"),
+                }
+            }
+            assert!(tasks.is_empty());
+
+            // A task that spawns nothing and waits leaves `poll_next` answering
+            // `Pending` without spinning.
+            let mut idle = Tasks::new(Box::pin(std::future::pending::<()>()));
+            assert_eq!(idle.poll_next(&mut cx), Poll::Pending);
+            unsafe { assert!(SPAWNED.is_empty()) };
+        }
+    }
 }
